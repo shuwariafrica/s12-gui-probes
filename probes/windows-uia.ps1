@@ -26,11 +26,12 @@ function Wait-AutomationElement {
     [Parameter(Mandatory)][System.Windows.Automation.AutomationElement]$Root,
     [Parameter(Mandatory)][System.Windows.Automation.Condition]$Condition,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$What,
+    [System.Windows.Automation.TreeScope]$Scope = [System.Windows.Automation.TreeScope]::Descendants,
     [ValidateRange(1, 300)][int]$Seconds = 30
   )
   $deadline = (Get-Date).AddSeconds($Seconds)
   while ((Get-Date) -lt $deadline) {
-    $found = $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $Condition)
+    $found = $Root.FindFirst($Scope, $Condition)
     if ($null -ne $found) { return $found }
     Start-Sleep -Milliseconds 200
   }
@@ -57,9 +58,13 @@ $window = Join-Path -Path $PSScriptRoot -ChildPath 'uia-window.ps1'
 $app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $window) -PassThru
 try {
   $root = [System.Windows.Automation.AutomationElement]::RootElement
-  $titled = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-    [System.Windows.Automation.AutomationElement]::NameProperty, 's12-uia')
-  $form = Wait-AutomationElement -Root $root -Condition $titled -What 'window titled s12-uia on this desktop'
+  # The window is a child of the desktop; its title bar, a descendant, carries the same name.
+  $titled = New-Object -TypeName System.Windows.Automation.AndCondition -ArgumentList @(
+    (New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
+      [System.Windows.Automation.AutomationElement]::NameProperty, 's12-uia')),
+    (New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)))
+  $form = Wait-AutomationElement -Root $root -Condition $titled -Scope Children -What 'window titled s12-uia on this desktop'
   'window: found through UI Automation'
 
   $editCondition = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
