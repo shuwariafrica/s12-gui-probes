@@ -20,17 +20,22 @@ sdk="${ANDROID_HOME}/cmdline-tools/latest/bin"
 echo no | "${sdk}/avdmanager" create avd --name s12 --package "${image}" --force >/dev/null
 
 adb="${ANDROID_HOME}/platform-tools/adb"
+# Every wait below is bounded and ends by printing the emulator's own log.
+fail() {
+  tail -n 80 emulator.log >&2
+  echo "$1" >&2
+  exit 1
+}
 start=${SECONDS}
 "${ANDROID_HOME}/emulator/emulator" -avd s12 -no-window -no-audio -no-boot-anim -no-snapshot \
   -gpu software -accel on >emulator.log 2>&1 &
-"${adb}" wait-for-device
+emulator=$!
+timeout 600 "${adb}" wait-for-device || fail 'no device reached adb within 600 s'
+echo "device in $((SECONDS - start)) s"
 booted=''
 until [[ ${booted} == 1 ]]; do
-  if ((SECONDS - start > 600)); then
-    tail -n 40 emulator.log >&2
-    echo 'the emulator did not finish booting within 600 s' >&2
-    exit 1
-  fi
+  kill -0 "${emulator}" 2>/dev/null || fail 'the emulator exited before the boot completed'
+  ((SECONDS - start <= 600)) || fail 'the emulator did not finish booting within 600 s'
   sleep 2
   booted=$("${adb}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') || booted=''
 done
