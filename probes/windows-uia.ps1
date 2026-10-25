@@ -121,10 +121,22 @@ try {
   'label: got: viauia (Value and Invoke patterns)'
 
   $edit.Patterns.Value.Pattern.SetValue('')
+  # Synthesised keys go to the foreground window's focused control, wherever that is.
+  $form.SetForeground()
   $edit.Focus()
+  $focused = $automation.FocusedElement()
+  "focus before keys: $($focused.ControlType) name '$($focused.Name)' process $($focused.Properties.ProcessId.Value)"
   [FlaUI.Core.Input.Keyboard]::Type('keys')
   [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::ENTER))
-  $null = Wait-Element -Root $form -Condition $cf.ByName('got: keys') -What "label reading 'got: keys'"
+  try {
+    $null = Wait-Element -Root $form -Condition $cf.ByName('got: keys') -What "label reading 'got: keys'"
+  }
+  catch {
+    $focused = $automation.FocusedElement()
+    "focus after keys: $($focused.ControlType) name '$($focused.Name)' process $($focused.Properties.ProcessId.Value)"
+    "field holds: '$($edit.Patterns.Value.Pattern.Value.Value)'"
+    throw
+  }
   'label: got: keys (synthesised keystrokes)'
   'PASS windows-uia: UIA3 found the controls by type and drove them, and synthesised keys reached the window'
 }
