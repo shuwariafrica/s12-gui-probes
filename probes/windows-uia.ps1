@@ -4,15 +4,15 @@
 Settles whether a job on this runner has an interactive desktop that UI tests can drive.
 
 .DESCRIPTION
-Prints the session the job runs in, then starts uia-window.ps1 in its own
-process and drives its window through FlaUI's UIA3 client, the COM UI
+Prints the session the job runs in, then starts uia-window.ps1, a WPF window,
+in its own process, finds it among the desktop's windows by its title and the
+application's process, and drives it through FlaUI's UIA3 client, the COM UI
 Automation client a .NET UI test uses: finds the field by its control type,
 sets it through the Value pattern, presses the button through the Invoke
 pattern and reads the label, then types into the field with synthesised
 keystrokes, which reach only a foreground window on an input desktop, and
-reads the label again. Before that it logs the window's children as the
-managed System.Windows.Automation client reports them, which in Windows
-PowerShell 5.1 gives every Windows Forms control as a Pane.
+reads the label again. Before that it logs the window's children as both the
+managed System.Windows.Automation client and UIA3 report them.
 
 FlaUI 5.0.0 and its interop come from nuget.org, each checked against the
 SHA-256 of the package NuGet's catalogue hashes, and load from one directory
@@ -86,13 +86,20 @@ $process = Get-Process -Id $PID
 $window = Join-Path -Path $PSScriptRoot -ChildPath 'uia-window.ps1'
 $out = Join-Path -Path $work -ChildPath 'window.out'
 $err = Join-Path -Path $work -ChildPath 'window.err'
-$app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $window) `
+$app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass', '-File', $window) `
   -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
 $automation = New-Object -TypeName FlaUI.UIA3.UIA3Automation
 try {
   $cf = $automation.ConditionFactory
-  $form = [FlaUI.Core.Application]::Attach($app.Id).GetMainWindow($automation, [TimeSpan]::FromSeconds(30))
-  if ($null -eq $form) { throw 'no main window within 30 s' }
+  # The started process's main window can be its console host, so the form is found by its title and process.
+  $titled = $cf.ByName('s12-uia').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Window)).And($cf.ByProcessId($app.Id))
+  $deadline = (Get-Date).AddSeconds(30)
+  $form = $null
+  while ($null -eq $form -and (Get-Date) -lt $deadline) {
+    $form = $automation.GetDesktop().FindFirstChild($titled)
+    if ($null -eq $form) { Start-Sleep -Milliseconds 200 }
+  }
+  if ($null -eq $form) { throw "no window titled s12-uia of process $($app.Id) within 30 s" }
   "window: found through UIA3; process $($form.Properties.ProcessId.Value) (the application's is $($app.Id)); class $($form.ClassName)"
 
   $managed = [System.Windows.Automation.AutomationElement]::FromHandle($form.Properties.NativeWindowHandle.Value)
