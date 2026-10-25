@@ -2,9 +2,17 @@
 # Boots an x86_64 Android 11 (API 30, the platform record's floor) emulator
 # headless with KVM forced on, waits for the boot to complete, opens Settings
 # and reads it through UI Automator's accessibility dump. Exit 0 on PASS.
+#
+# Every wait is bounded, and every failure after the emulator starts prints
+# its log. S12_WAIT shortens the device and boot bound for a local test of
+# those failure paths.
 set -euo pipefail
 : "${ANDROID_HOME:?the hosted image sets ANDROID_HOME}"
-readonly image='system-images;android-30;default;x86_64'
+readonly image='system-images;android-30;default;x86_64' wait_s=${S12_WAIT:-600}
+# The hosted image's cmdline-tools write AVDs under XDG_CONFIG_HOME, which the
+# emulator never searches; both honour ANDROID_AVD_HOME.
+export ANDROID_AVD_HOME="${HOME}/.android/avd"
+mkdir -p "${ANDROID_AVD_HOME}"
 
 # GitHub's documented step for KVM on standard Linux runners (changelog 2024-04-02).
 echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
@@ -15,12 +23,16 @@ ls -l /dev/kvm
 
 sdk="${ANDROID_HOME}/cmdline-tools/latest/bin"
 # `yes` ends on SIGPIPE once sdkmanager stops reading; that is its normal end.
-"${sdk}/sdkmanager" --licenses < <(yes || true) >/dev/null
-"${sdk}/sdkmanager" emulator platform-tools "${image}" >/dev/null
-echo no | "${sdk}/avdmanager" create avd --name s12 --package "${image}" --force >/dev/null
+timeout 300 "${sdk}/sdkmanager" --licenses < <(yes || true) >/dev/null
+timeout 600 "${sdk}/sdkmanager" emulator platform-tools "${image}" >/dev/null
+echo no | timeout 120 "${sdk}/avdmanager" create avd --name s12 --package "${image}" --force >/dev/null
+[[ -f ${ANDROID_AVD_HOME}/s12.ini ]] || {
+  echo "avdmanager wrote no s12.ini in ${ANDROID_AVD_HOME}" >&2
+  exit 1
+}
+timeout 60 "${ANDROID_HOME}/emulator/emulator" -accel-check || true
 
 adb="${ANDROID_HOME}/platform-tools/adb"
-# Every wait below is bounded and ends by printing the emulator's own log.
 fail() {
   tail -n 80 emulator.log >&2
   echo "$1" >&2
@@ -30,20 +42,30 @@ start=${SECONDS}
 "${ANDROID_HOME}/emulator/emulator" -avd s12 -no-window -no-audio -no-boot-anim -no-snapshot \
   -gpu software -accel on >emulator.log 2>&1 &
 emulator=$!
-timeout 600 "${adb}" wait-for-device || fail 'no device reached adb within 600 s'
+# alive_within_bound <what>: fails the probe once the emulator has exited or the bound has passed.
+alive_within_bound() {
+  kill -0 "${emulator}" 2>/dev/null || fail "the emulator exited while waiting for $1"
+  ((SECONDS - start <= wait_s)) || fail "waited ${wait_s} s for $1"
+}
+state=''
+until [[ ${state} == device ]]; do
+  alive_within_bound 'a device on adb'
+  sleep 2
+  state=$(timeout 10 "${adb}" get-state 2>/dev/null) || state=''
+done
 echo "device in $((SECONDS - start)) s"
 booted=''
 until [[ ${booted} == 1 ]]; do
-  kill -0 "${emulator}" 2>/dev/null || fail 'the emulator exited before the boot completed'
-  ((SECONDS - start <= 600)) || fail 'the emulator did not finish booting within 600 s'
+  alive_within_bound 'a completed boot'
   sleep 2
-  booted=$("${adb}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') || booted=''
+  booted=$(timeout 10 "${adb}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') || booted=''
 done
 echo "booted in $((SECONDS - start)) s with acceleration forced on"
 
-"${adb}" shell am start -W -a android.settings.SETTINGS >/dev/null
-"${adb}" shell uiautomator dump /sdcard/window.xml >/dev/null
-"${adb}" pull /sdcard/window.xml window.xml >/dev/null
-grep -o 'text="[^"]*Settings[^"]*"' window.xml | head -n 3
-"${adb}" emu kill >/dev/null
+timeout 60 "${adb}" shell am start -W -a android.settings.SETTINGS >/dev/null || fail 'Settings did not start within 60 s'
+timeout 60 "${adb}" shell uiautomator dump /sdcard/window.xml >/dev/null || fail 'no UI Automator dump within 60 s'
+timeout 30 "${adb}" pull /sdcard/window.xml window.xml >/dev/null || fail 'the dump was not pulled within 30 s'
+found=$(grep -o 'text="[^"]*Settings[^"]*"' window.xml) || fail 'the dump names no Settings text'
+printf '%s\n' "${found}"
+timeout 30 "${adb}" emu kill >/dev/null || true
 echo 'PASS android-emulator: KVM-accelerated API 30 booted; Settings read through UI Automator'

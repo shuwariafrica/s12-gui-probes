@@ -5,92 +5,111 @@ Settles whether a job on this runner has an interactive desktop that UI tests ca
 
 .DESCRIPTION
 Prints the session the job runs in, then starts uia-window.ps1 in its own
-process, finds its window through UI Automation, sets its field through the
-Value pattern, presses its button through the Invoke pattern and reads its
-label; then types into the field with synthesised keystrokes, which reach only
-a foreground window on an input desktop, and reads the label again. Windows
-PowerShell 5.1, because UIAutomationClient ships with the .NET Framework on
-every Windows edition.
+process and drives its window through FlaUI's UIA3 client, the COM UI
+Automation client a .NET UI test uses: finds the field by its control type,
+sets it through the Value pattern, presses the button through the Invoke
+pattern and reads the label, then types into the field with synthesised
+keystrokes, which reach only a foreground window on an input desktop, and
+reads the label again. Before that it logs the window's children as the
+managed System.Windows.Automation client reports them, which in Windows
+PowerShell 5.1 gives every Windows Forms control as a Pane.
+
+FlaUI 5.0.0 and its interop come from nuget.org, each checked against the
+SHA-256 of the package NuGet's catalogue hashes. Every wait is bounded; a
+failure prints the window process's own output.
 
 .OUTPUTS
 One line per check; the last is PASS. Any failure is a terminating error.
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 
-function Wait-AutomationElement {
+$packages = @(
+  @{ Id = 'flaui.core'; Version = '5.0.0'; Sha256 = '191cc65ea82036b77f1872e6d4ebf743d3d120895bba2fa5248d126cd6f568a7'; Dll = 'lib/net48/FlaUI.Core.dll' },
+  @{ Id = 'flaui.uia3'; Version = '5.0.0'; Sha256 = 'd5d2e083539a04bf6c9053781dfd47332854a76faeb8e9c3c68cc82109f711f2'; Dll = 'lib/net48/FlaUI.UIA3.dll' },
+  @{ Id = 'interop.uiautomationclient'; Version = '10.19041.0'; Sha256 = '0d2ed17db2cb13a262f0580ab992db87577651c25a9899053df4114b4d9ff3b1'; Dll = 'lib/net45/Interop.UIAutomationClient.dll' }
+)
+$work = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 's12-uia'
+$null = New-Item -ItemType Directory -Path $work -Force
+foreach ($package in $packages) {
+  $archive = Join-Path -Path $work -ChildPath "$($package.Id).$($package.Version).zip"
+  $uri = "https://api.nuget.org/v3-flatcontainer/$($package.Id)/$($package.Version)/$($package.Id).$($package.Version).nupkg"
+  Invoke-WebRequest -Uri $uri -OutFile $archive -UseBasicParsing -TimeoutSec 120
+  $sum = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($sum -ne $package.Sha256) { throw "$($package.Id) $($package.Version): SHA-256 $sum, expected $($package.Sha256)" }
+  $unpacked = Join-Path -Path $work -ChildPath $package.Id
+  Expand-Archive -Path $archive -DestinationPath $unpacked -Force
+  Add-Type -Path (Join-Path -Path $unpacked -ChildPath $package.Dll)
+}
+
+function Wait-Element {
   [CmdletBinding()]
-  [OutputType([System.Windows.Automation.AutomationElement])]
+  [OutputType([FlaUI.Core.AutomationElements.AutomationElement])]
   param(
-    [Parameter(Mandatory)][System.Windows.Automation.AutomationElement]$Root,
-    [Parameter(Mandatory)][System.Windows.Automation.Condition]$Condition,
+    [Parameter(Mandatory)][FlaUI.Core.AutomationElements.AutomationElement]$Root,
+    [Parameter(Mandatory)][FlaUI.Core.Conditions.ConditionBase]$Condition,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$What,
-    [System.Windows.Automation.TreeScope]$Scope = [System.Windows.Automation.TreeScope]::Descendants,
     [ValidateRange(1, 300)][int]$Seconds = 30
   )
   $deadline = (Get-Date).AddSeconds($Seconds)
   while ((Get-Date) -lt $deadline) {
-    $found = $Root.FindFirst($Scope, $Condition)
+    $found = $Root.FindFirstDescendant($Condition)
     if ($null -ne $found) { return $found }
     Start-Sleep -Milliseconds 200
   }
   throw "no $What within $Seconds s"
 }
 
-function Wait-LabelText {
-  [CmdletBinding()]
-  [OutputType([string])]
-  param(
-    [Parameter(Mandatory)][System.Windows.Automation.AutomationElement]$Window,
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Expected
-  )
-  $condition = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-    [System.Windows.Automation.AutomationElement]::NameProperty, $Expected)
-  $null = Wait-AutomationElement -Root $Window -Condition $condition -What "label reading '$Expected'"
-  "label: $Expected"
-}
-
 $process = Get-Process -Id $PID
 "session $($process.SessionId); interactive $([Environment]::UserInteractive); user $([Environment]::UserName)"
 
 $window = Join-Path -Path $PSScriptRoot -ChildPath 'uia-window.ps1'
-$app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $window) -PassThru
+$out = Join-Path -Path $work -ChildPath 'window.out'
+$err = Join-Path -Path $work -ChildPath 'window.err'
+$app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $window) `
+  -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+$automation = New-Object -TypeName FlaUI.UIA3.UIA3Automation
 try {
-  $root = [System.Windows.Automation.AutomationElement]::RootElement
-  # The window is a child of the desktop; its title bar, a descendant, carries the same name.
-  $titled = New-Object -TypeName System.Windows.Automation.AndCondition -ArgumentList @(
-    (New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-      [System.Windows.Automation.AutomationElement]::NameProperty, 's12-uia')),
-    (New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-      [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)))
-  $form = Wait-AutomationElement -Root $root -Condition $titled -Scope Children -What 'window titled s12-uia on this desktop'
-  'window: found through UI Automation'
-  "window: process $($form.Current.ProcessId) (the application's is $($app.Id)); class $($form.Current.ClassName)"
-  # What UI Automation exposes under the window, in the raw view, before any control is sought.
+  $cf = $automation.ConditionFactory
+  $form = [FlaUI.Core.Application]::Attach($app.Id).GetMainWindow($automation, [TimeSpan]::FromSeconds(30))
+  if ($null -eq $form) { throw 'no main window within 30 s' }
+  "window: found through UIA3; process $($form.Properties.ProcessId.Value) (the application's is $($app.Id)); class $($form.ClassName)"
+
+  $managed = [System.Windows.Automation.AutomationElement]::FromHandle($form.Properties.NativeWindowHandle.Value)
   $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
-  $child = $walker.GetFirstChild($form)
+  $child = $walker.GetFirstChild($managed)
   while ($null -ne $child) {
-    "raw child: $($child.Current.ControlType.ProgrammaticName) name '$($child.Current.Name)' class $($child.Current.ClassName) id '$($child.Current.AutomationId)'"
+    "managed client child: $($child.Current.ControlType.ProgrammaticName) name '$($child.Current.Name)' class $($child.Current.ClassName)"
     $child = $walker.GetNextSibling($child)
   }
+  foreach ($child in $form.FindAllChildren()) {
+    "UIA3 child: $($child.ControlType) name '$($child.Name)' class $($child.ClassName)"
+  }
 
-  $editCondition = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-  $edit = Wait-AutomationElement -Root $form -Condition $editCondition -What 'edit field'
-  $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('viauia')
-  $buttonCondition = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
-    [System.Windows.Automation.AutomationElement]::NameProperty, 'Send')
-  $send = Wait-AutomationElement -Root $form -Condition $buttonCondition -What 'Send button'
-  $send.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-  Wait-LabelText -Window $form -Expected 'got: viauia'
+  $edit = Wait-Element -Root $form -Condition $cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Edit) -What 'Edit control'
+  $edit.Patterns.Value.Pattern.SetValue('viauia')
+  $send = Wait-Element -Root $form -Condition $cf.ByName('Send').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Button)) -What 'Send button'
+  $send.Patterns.Invoke.Pattern.Invoke()
+  $null = Wait-Element -Root $form -Condition $cf.ByName('got: viauia') -What "label reading 'got: viauia'"
+  'label: got: viauia (Value and Invoke patterns)'
 
-  $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('')
-  $edit.SetFocus()
-  [System.Windows.Forms.SendKeys]::SendWait('keys{ENTER}')
-  Wait-LabelText -Window $form -Expected 'got: keys'
-  'PASS windows-uia: UI Automation drove the window, and synthesised keys reached it'
+  $edit.Patterns.Value.Pattern.SetValue('')
+  $edit.Focus()
+  [FlaUI.Core.Input.Keyboard]::Type('keys')
+  [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::ENTER))
+  $null = Wait-Element -Root $form -Condition $cf.ByName('got: keys') -What "label reading 'got: keys'"
+  'label: got: keys (synthesised keystrokes)'
+  'PASS windows-uia: UIA3 found the controls by type and drove them, and synthesised keys reached the window'
+}
+catch {
+  foreach ($log in @($out, $err)) {
+    if (Test-Path -Path $log) { "--- $(Split-Path -Path $log -Leaf)"; Get-Content -Path $log }
+  }
+  throw
 }
 finally {
+  $automation.Dispose()
   Stop-Process -Id $app.Id -ErrorAction Ignore # already gone when the window closed itself
 }
