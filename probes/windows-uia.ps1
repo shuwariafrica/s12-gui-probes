@@ -66,6 +66,14 @@ try {
       [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)))
   $form = Wait-AutomationElement -Root $root -Condition $titled -Scope Children -What 'window titled s12-uia on this desktop'
   'window: found through UI Automation'
+  "window: process $($form.Current.ProcessId) (the application's is $($app.Id)); class $($form.Current.ClassName)"
+  # What UI Automation exposes under the window, in the raw view, before any control is sought.
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $child = $walker.GetFirstChild($form)
+  while ($null -ne $child) {
+    "raw child: $($child.Current.ControlType.ProgrammaticName) name '$($child.Current.Name)' class $($child.Current.ClassName) id '$($child.Current.AutomationId)'"
+    $child = $walker.GetNextSibling($child)
+  }
 
   $editCondition = New-Object -TypeName System.Windows.Automation.PropertyCondition -ArgumentList @(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
