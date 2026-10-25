@@ -1,0 +1,53 @@
+# Settles, on GitHub's standard hosted runners, what S12's design cannot run
+# without them. Dispatched by hand in a throwaway public repository; nothing
+# here holds or reads a credential.
+name: gui-probes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-uia:
+    name: windows / ${{ matrix.runner }} / uia
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: A window on the job's desktop takes UI Automation and keys
+        shell: powershell
+        run: ./probes/windows-uia.ps1
+
+  android-emulator:
+    name: linux / ubuntu-24.04 / android-emulator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: An accelerated emulator boots and is read through UI Automator
+        run: bash probes/android-emulator.sh
+
+  macos-javafx:
+    name: macos / ${{ matrix.runner }} / javafx
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: TestFX drives a JavaFX window
+        run: bash probes/macos-javafx.sh
