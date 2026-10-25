@@ -15,8 +15,11 @@ managed System.Windows.Automation client reports them, which in Windows
 PowerShell 5.1 gives every Windows Forms control as a Pane.
 
 FlaUI 5.0.0 and its interop come from nuget.org, each checked against the
-SHA-256 of the package NuGet's catalogue hashes. Every wait is bounded; a
-failure prints the window process's own output.
+SHA-256 of the package NuGet's catalogue hashes, and load from one directory
+with each dependency before its dependants: LoadFrom resolves a reference from
+the referring assembly's directory, and Windows PowerShell 5.1's Add-Type -Path
+enumerates an assembly's types as it loads it. Every wait is bounded; a failure
+prints the window process's own output and any type that failed to load.
 
 .OUTPUTS
 One line per check; the last is PASS. Any failure is a terminating error.
@@ -32,7 +35,8 @@ $packages = @(
   @{ Id = 'interop.uiautomationclient'; Version = '10.19041.0'; Sha256 = '0d2ed17db2cb13a262f0580ab992db87577651c25a9899053df4114b4d9ff3b1'; Dll = 'lib/net45/Interop.UIAutomationClient.dll' }
 )
 $work = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 's12-uia'
-$null = New-Item -ItemType Directory -Path $work -Force
+$lib = Join-Path -Path $work -ChildPath 'lib'
+$null = New-Item -ItemType Directory -Path $lib -Force
 foreach ($package in $packages) {
   $archive = Join-Path -Path $work -ChildPath "$($package.Id).$($package.Version).zip"
   $uri = "https://api.nuget.org/v3-flatcontainer/$($package.Id)/$($package.Version)/$($package.Id).$($package.Version).nupkg"
@@ -41,7 +45,21 @@ foreach ($package in $packages) {
   if ($sum -ne $package.Sha256) { throw "$($package.Id) $($package.Version): SHA-256 $sum, expected $($package.Sha256)" }
   $unpacked = Join-Path -Path $work -ChildPath $package.Id
   Expand-Archive -Path $archive -DestinationPath $unpacked -Force
-  Add-Type -Path (Join-Path -Path $unpacked -ChildPath $package.Dll)
+  Copy-Item -Path (Join-Path -Path $unpacked -ChildPath $package.Dll) -Destination $lib
+}
+try {
+  foreach ($name in @('Interop.UIAutomationClient.dll', 'FlaUI.Core.dll', 'FlaUI.UIA3.dll')) {
+    $null = [System.Reflection.Assembly]::LoadFrom((Join-Path -Path $lib -ChildPath $name))
+  }
+  $null = [FlaUI.UIA3.UIA3Automation].Assembly.GetTypes()
+}
+catch {
+  for ($e = $_.Exception; $null -ne $e; $e = $e.InnerException) {
+    if ($e -is [System.Reflection.ReflectionTypeLoadException]) {
+      $e.LoaderExceptions | ForEach-Object { "type load: $($_.Message)" }
+    }
+  }
+  throw
 }
 
 function Wait-Element {

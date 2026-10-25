@@ -62,10 +62,19 @@ until [[ ${booted} == 1 ]]; do
 done
 echo "booted in $((SECONDS - start)) s with acceleration forced on"
 
+timeout 30 "${adb}" shell wm dismiss-keyguard >/dev/null || true
 timeout 60 "${adb}" shell am start -W -a android.settings.SETTINGS >/dev/null || fail 'Settings did not start within 60 s'
-timeout 60 "${adb}" shell uiautomator dump /sdcard/window.xml >/dev/null || fail 'no UI Automator dump within 60 s'
-timeout 30 "${adb}" pull /sdcard/window.xml window.xml >/dev/null || fail 'the dump was not pulled within 30 s'
-found=$(grep -o 'text="[^"]*Settings[^"]*"' window.xml) || fail 'the dump names no Settings text'
-printf '%s\n' "${found}"
+# The dump is of the foreground window: Settings is read once its own package draws it.
+dumped=${SECONDS}
+until grep -q 'package="com.android.settings"' window.xml 2>/dev/null; do
+  if ((SECONDS - dumped > 60)); then
+    grep -o 'text="[^"]*"' window.xml 2>/dev/null | sort -u | head -n 20 >&2 || true
+    fail 'no UI Automator dump of Settings within 60 s'
+  fi
+  sleep 2
+  timeout 30 "${adb}" shell uiautomator dump /sdcard/window.xml >/dev/null || continue
+  timeout 30 "${adb}" pull /sdcard/window.xml window.xml >/dev/null || continue
+done
+grep -o 'text="[^"]*"' window.xml | sort -u | head -n 10
 timeout 30 "${adb}" emu kill >/dev/null || true
-echo 'PASS android-emulator: KVM-accelerated API 30 booted; Settings read through UI Automator'
+echo "PASS android-emulator: KVM-accelerated API 30 booted; Settings' window read through UI Automator"
