@@ -1,33 +1,78 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-Settles whether a job on this runner has an interactive desktop that UI tests can drive.
+Settles whether a job on this runner can drive a WinUI 3 window through UI Automation and keys.
 
 .DESCRIPTION
-Prints the session the job runs in, then starts uia-window.ps1, a WPF window,
-in its own process, finds it among the desktop's windows by its title and the
-application's process, and drives it through FlaUI's UIA3 client, the COM UI
-Automation client a .NET UI test uses: finds the field by its control type,
-sets it through the Value pattern, presses the button through the Invoke
-pattern and reads the label, then types into the field with synthesised
-keystrokes, which reach only a foreground window on an input desktop, and
-reads the label again. Before that it logs the window's children as both the
-managed System.Windows.Automation client and UIA3 report them.
+Prints the session and OS build the job runs in, starts the WinUI 3 window built from
+probes/winui in its own process, finds it among the desktop's windows by its title and
+process, and drives it through FlaUI's UIA3 client: finds the field by its control type, sets
+it through the Value pattern, presses the button through the Invoke pattern and reads the
+label, types into the field with synthesised keystrokes and reads the label again, then checks
+keyboard completeness: Tab moves focus from the field to the Send button, Space activates it,
+and the label shows the activation.
 
-FlaUI 5.0.0 and its interop come from nuget.org, each checked against the
-SHA-256 of the package NuGet's catalogue hashes, and load from one directory
-with each dependency before its dependants: LoadFrom resolves a reference from
-the referring assembly's directory, and Windows PowerShell 5.1's Add-Type -Path
-enumerates an assembly's types as it loads it. Every wait is bounded; a failure
-prints the window process's own output and any type that failed to load.
+Synthesised keys reach only the foreground window. Before typing, the focused element is read;
+when another process holds it, that element's top-level window is closed through UI
+Automation's Window pattern and focus is asserted to be the application's, or the probe fails
+naming the holding process and window.
+
+Windows PowerShell 5.1, because FlaUI's net48 assemblies load into it on every image. FlaUI
+5.0.0 and its interop come from nuget.org, each checked against the SHA-256 of the package
+NuGet's catalogue hashes, and load from one directory with each dependency before its
+dependants. Every wait is bounded; a failure prints the window's own log and its exit code if
+it has exited.
+
+One line, stage: <name>, is printed as each stage is entered, so the log shows the last stage
+reached. The stages, in order: runtime and build (the workflow's steps), launch (this driver's
+own machinery: the package fetch and load), start (printed immediately before the window's
+process is started), uia-root, controls, patterns, keys and keyboard-completeness. An exited
+window's exit code is printed as: window process exit code: 0x<hex>.
+
+Reading a failure (the decision record's section 9; hosted/classify.sh applies it to the logs
+of the two x64 legs). The matrix runs the x64 build on windows-2025, the arm64 build on
+windows-11-arm, and the x64 build on windows-11-arm under Windows 11's x64 emulation with the
+x64 runtime installed: the x64 control on an OS the Windows App SDK lists. Every leg builds
+self-contained, so the legs differ only in architecture and OS.
+  (i) A probe defect: any leg whose last stage is runtime, build or launch. That leg is fixed
+      and run again before anything is classified.
+  From start on, a failure is the application's outcome at its stage, whether the window's
+  process is still running or has exited.
+  windows-2025's own result decides the record. Its PASS keeps the record as written, whatever
+  the other legs show; an emulated x64 failure with windows-2025 passing is an emulation
+  finding, never a fork.
+  When windows-2025 fails at stage S, from start on, the emulated x64 leg decides the
+  attribution:
+  (ii) An OS cause: the emulated leg passes S. This leads to the owner's fork as the record
+      states it.
+  (iii) A WinUI 3 cause: the emulated leg fails at S, its window running or exited. This is a
+      fork for the owner as well. No hosted instrumented x64 run exists, and a self-hosted
+      Windows 11 machine cures nothing.
+  Unattributed: the emulated leg fails at an earlier stage, from start on. The record states
+      windows-2025's failure at S with both logs, and the fork goes to the owner without an
+      attribution.
+  An emulated leg whose last stage is runtime, build or launch is (i) for that leg: run again.
+The arm64 leg's role is unchanged: it settles the arm64 keyboard line.
+
+.PARAMETER Application
+The built S12WinUI.exe.
 
 .OUTPUTS
 One line per check; the last is PASS. Any failure is a terminating error.
 #>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory)][ValidateScript({ Test-Path -Path $_ -PathType Leaf })][string]$Application
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+
+$process = Get-Process -Id $PID
+$build = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+"session $($process.SessionId); interactive $([Environment]::UserInteractive); user $([Environment]::UserName)"
+"OS $($build.ProductName) $($build.DisplayVersion) build $($build.CurrentBuild).$($build.UBR); $env:PROCESSOR_ARCHITECTURE"
+'stage: launch'
 
 $packages = @(
   @{ Id = 'flaui.core'; Version = '5.0.0'; Sha256 = '191cc65ea82036b77f1872e6d4ebf743d3d120895bba2fa5248d126cd6f568a7'; Dll = 'lib/net48/FlaUI.Core.dll' },
@@ -80,73 +125,122 @@ function Wait-Element {
   throw "no $What within $Seconds s"
 }
 
-$process = Get-Process -Id $PID
-"session $($process.SessionId); interactive $([Environment]::UserInteractive); user $([Environment]::UserName)"
+function Wait-Focus {
+  [CmdletBinding()]
+  [OutputType([FlaUI.Core.AutomationElements.AutomationElement])]
+  param(
+    [Parameter(Mandatory)][FlaUI.UIA3.UIA3Automation]$Automation,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ButtonName,
+    [Parameter(Mandatory)][int]$ProcessId,
+    [ValidateRange(1, 300)][int]$Seconds = 30
+  )
+  $deadline = (Get-Date).AddSeconds($Seconds)
+  while ((Get-Date) -lt $deadline) {
+    $focused = $Automation.FocusedElement()
+    if ($focused.ControlType -eq [FlaUI.Core.Definitions.ControlType]::Button -and $focused.Name -eq $ButtonName -and $focused.Properties.ProcessId.Value -eq $ProcessId) {
+      return $focused
+    }
+    Start-Sleep -Milliseconds 200
+  }
+  throw "focus not on the '$ButtonName' button of process $ProcessId within $Seconds s: $(Get-Holder -Element $Automation.FocusedElement())"
+}
 
-$window = Join-Path -Path $PSScriptRoot -ChildPath 'uia-window.ps1'
-$out = Join-Path -Path $work -ChildPath 'window.out'
-$err = Join-Path -Path $work -ChildPath 'window.err'
-$app = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Sta', '-ExecutionPolicy', 'Bypass', '-File', $window) `
-  -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+function Get-Holder {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param([Parameter(Mandatory)][FlaUI.Core.AutomationElements.AutomationElement]$Element)
+  $holder = $Element.Properties.ProcessId.Value
+  $name = (Get-Process -Id $holder -ErrorAction Ignore).ProcessName # gone if it exited meanwhile
+  "$($Element.ControlType) name '$($Element.Name)' process $holder ($name)"
+}
+
+$log = Join-Path -Path $work -ChildPath 'window.log'
+'stage: start'
+$app = Start-Process -FilePath $Application -ArgumentList @("`"$log`"") -PassThru
 $automation = New-Object -TypeName FlaUI.UIA3.UIA3Automation
 try {
+  'stage: uia-root'
   $cf = $automation.ConditionFactory
-  # The started process's main window can be its console host, so the form is found by its title and process.
-  $titled = $cf.ByName('s12-uia').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Window)).And($cf.ByProcessId($app.Id))
-  $deadline = (Get-Date).AddSeconds(30)
+  $desktop = $automation.GetDesktop()
+  $titled = $cf.ByName('s12-winui').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Window)).And($cf.ByProcessId($app.Id))
+  $deadline = (Get-Date).AddSeconds(60)
   $form = $null
-  while ($null -eq $form -and (Get-Date) -lt $deadline) {
-    $form = $automation.GetDesktop().FindFirstChild($titled)
+  while ($null -eq $form -and (Get-Date) -lt $deadline -and -not $app.HasExited) {
+    $form = $desktop.FindFirstChild($titled)
     if ($null -eq $form) { Start-Sleep -Milliseconds 200 }
   }
-  if ($null -eq $form) { throw "no window titled s12-uia of process $($app.Id) within 30 s" }
+  if ($app.HasExited) { throw ('the window process exited with 0x{0:X8} before its window appeared' -f $app.ExitCode) }
+  if ($null -eq $form) { throw "no window titled s12-winui of process $($app.Id) within 60 s" }
   "window: found through UIA3; process $($form.Properties.ProcessId.Value) (the application's is $($app.Id)); class $($form.ClassName)"
-
-  $managed = [System.Windows.Automation.AutomationElement]::FromHandle($form.Properties.NativeWindowHandle.Value)
-  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
-  $child = $walker.GetFirstChild($managed)
-  while ($null -ne $child) {
-    "managed client child: $($child.Current.ControlType.ProgrammaticName) name '$($child.Current.Name)' class $($child.Current.ClassName)"
-    $child = $walker.GetNextSibling($child)
-  }
-  foreach ($child in $form.FindAllChildren()) {
-    "UIA3 child: $($child.ControlType) name '$($child.Name)' class $($child.ClassName)"
+  Get-Content -Path $log
+  foreach ($element in $form.FindAllDescendants()) {
+    "UIA3 element: $($element.ControlType) name '$($element.Name)' class $($element.ClassName)"
   }
 
+  'stage: controls'
   $edit = Wait-Element -Root $form -Condition $cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Edit) -What 'Edit control'
-  $edit.Patterns.Value.Pattern.SetValue('viauia')
   $send = Wait-Element -Root $form -Condition $cf.ByName('Send').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Button)) -What 'Send button'
+
+  'stage: patterns'
+  $edit.Patterns.Value.Pattern.SetValue('viauia')
   $send.Patterns.Invoke.Pattern.Invoke()
-  $null = Wait-Element -Root $form -Condition $cf.ByName('got: viauia') -What "label reading 'got: viauia'"
+  $null = Wait-Element -Root $form -Condition $cf.ByName('got: viauia').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Text)) -What "Text reading 'got: viauia'"
   'label: got: viauia (Value and Invoke patterns)'
 
+  'stage: keys'
   $edit.Patterns.Value.Pattern.SetValue('')
-  # Synthesised keys go to the foreground window's focused control, wherever that is.
   $form.SetForeground()
   $edit.Focus()
   $focused = $automation.FocusedElement()
-  "focus before keys: $($focused.ControlType) name '$($focused.Name)' process $($focused.Properties.ProcessId.Value)"
+  "focus before keys: $(Get-Holder -Element $focused)"
+  if ($focused.Properties.ProcessId.Value -ne $app.Id) {
+    $walker = $automation.TreeWalkerFactory.GetControlViewWalker()
+    $top = $focused
+    for ($parent = $walker.GetParent($top); $null -ne $parent -and -not $parent.Equals($desktop); $parent = $walker.GetParent($top)) { $top = $parent }
+    $foreign = "window '$($top.Name)' of $(Get-Holder -Element $top)"
+    if (-not $top.Patterns.Window.IsSupported) { throw "foreground held by $foreign, which offers no Window pattern" }
+    "closing $foreign through the Window pattern"
+    $top.Patterns.Window.Pattern.Close()
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+      Start-Sleep -Milliseconds 200
+      $form.SetForeground()
+      $edit.Focus()
+      $focused = $automation.FocusedElement()
+    } while ($focused.Properties.ProcessId.Value -ne $app.Id -and (Get-Date) -lt $deadline)
+    "focus after closing: $(Get-Holder -Element $focused)"
+    if ($focused.Properties.ProcessId.Value -ne $app.Id) { throw "foreground still not the application's within 30 s of closing $foreign" }
+  }
   [FlaUI.Core.Input.Keyboard]::Type('keys')
   [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::ENTER))
   try {
-    $null = Wait-Element -Root $form -Condition $cf.ByName('got: keys') -What "label reading 'got: keys'"
+    $null = Wait-Element -Root $form -Condition $cf.ByName('got: keys').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Text)) -What "Text reading 'got: keys'"
   }
   catch {
-    $focused = $automation.FocusedElement()
-    "focus after keys: $($focused.ControlType) name '$($focused.Name)' process $($focused.Properties.ProcessId.Value)"
+    "focus after keys: $(Get-Holder -Element $automation.FocusedElement())"
     "field holds: '$($edit.Patterns.Value.Pattern.Value.Value)'"
     throw
   }
   'label: got: keys (synthesised keystrokes)'
-  'PASS windows-uia: UIA3 found the controls by type and drove them, and synthesised keys reached the window'
+
+  'stage: keyboard-completeness'
+  # The label still reads 'got: keys'; a different value tells this activation from the Enter above.
+  $edit.Patterns.Value.Pattern.SetValue('tabbed')
+  $edit.Focus()
+  [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::TAB))
+  $focused = Wait-Focus -Automation $automation -ButtonName 'Send' -ProcessId $app.Id
+  "focus after Tab: $(Get-Holder -Element $focused)"
+  [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::SPACE))
+  $null = Wait-Element -Root $form -Condition $cf.ByName('got: tabbed').And($cf.ByControlType([FlaUI.Core.Definitions.ControlType]::Text)) -What "Text reading 'got: tabbed'"
+  'label: got: tabbed (Tab to Send, Space)'
+  'PASS windows-uia: UIA3 found the WinUI 3 controls by type and drove them, synthesised keys reached the window, and Tab and Space operated it'
 }
 catch {
-  foreach ($log in @($out, $err)) {
-    if (Test-Path -Path $log) { "--- $(Split-Path -Path $log -Leaf)"; Get-Content -Path $log }
-  }
+  if ($app.HasExited) { 'window process exit code: 0x{0:X8}' -f $app.ExitCode }
+  if (Test-Path -Path $log) { '--- window.log'; Get-Content -Path $log }
   throw
 }
 finally {
   $automation.Dispose()
-  Stop-Process -Id $app.Id -ErrorAction Ignore # already gone when the window closed itself
+  Stop-Process -Id $app.Id -ErrorAction Ignore # already gone if it exited
 }
