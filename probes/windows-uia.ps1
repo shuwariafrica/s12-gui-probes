@@ -4,7 +4,7 @@
 Settles whether a job on this runner can drive a WinUI 3 window through UI Automation and keys.
 
 .DESCRIPTION
-Prints the session and OS build the job runs in, starts the WinUI 3 window built from
+Prints the user and OS build the job runs as, starts the WinUI 3 window built from
 probes/winui in its own process, finds it among the desktop's windows by its title and
 process, and drives it through FlaUI's UIA3 client: finds the field by its control type, sets
 it through the Value pattern, presses the button through the Invoke pattern and reads the
@@ -12,10 +12,16 @@ label, types into the field with synthesised keystrokes and reads the label agai
 keyboard completeness: Tab moves focus from the field to the Send button, Space activates it,
 and the label shows the activation.
 
-Synthesised keys reach only the foreground window. Before typing, the focused element is read;
-when another process holds it, that element's top-level window is closed through UI
-Automation's Window pattern and focus is asserted to be the application's, or the probe fails
-naming the holding process and window.
+Synthesised keys reach only the foreground window. Before the window starts, the policy
+HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE DisablePrivacyExperience is set to 1 (DWORD),
+logged and read back: the hosted windows-11-arm image shows its first-sign-in privacy window
+(WWAHost) on the desktop, and the policy is the first means against it. Before typing, the
+focused element is read; when another process holds it, that element's top-level window is
+closed through UI Automation's Window pattern first. If a foreign window still holds the
+foreground, its button named Accept, or else the one named Next..., is pressed through the
+Invoke pattern, repeatedly, for at most 60 s; each window and button pressed is logged. Focus
+is then asserted to be the application's, or the probe fails naming the holding process and
+window.
 
 Windows PowerShell 5.1, because FlaUI's net48 assemblies load into it on every image. FlaUI
 5.0.0 and its interop come from nuget.org, each checked against the SHA-256 of the package
@@ -29,30 +35,22 @@ own machinery: the package fetch and load), start (printed immediately before th
 process is started), uia-root, controls, patterns, keys and keyboard-completeness. An exited
 window's exit code is printed as: window process exit code: 0x<hex>.
 
-Reading a failure (the decision record's section 9; hosted/classify.sh applies it to the logs
-of the two x64 legs). The matrix runs the x64 build on windows-2025, the arm64 build on
+Reading a log. The matrix runs the x64 build on windows-2025, the arm64 build on
 windows-11-arm, and the x64 build on windows-11-arm under Windows 11's x64 emulation with the
 x64 runtime installed: the x64 control on an OS the Windows App SDK lists. Every leg builds
-self-contained, so the legs differ only in architecture and OS.
-  (i) A probe defect: any leg whose last stage is runtime, build or launch. That leg is fixed
-      and run again before anything is classified.
-  From start on, a failure is the application's outcome at its stage, whether the window's
-  process is still running or has exited.
-  windows-2025's own result decides the record. Its PASS keeps the record as written, whatever
-  the other legs show; an emulated x64 failure with windows-2025 passing is an emulation
-  finding, never a fork.
-  When windows-2025 fails at stage S, from start on, the emulated x64 leg decides the
-  attribution:
-  (ii) An OS cause: the emulated leg passes S. This leads to the owner's fork as the record
-      states it.
-  (iii) A WinUI 3 cause: the emulated leg fails at S, its window running or exited. This is a
-      fork for the owner as well. No hosted instrumented x64 run exists, and a self-hosted
-      Windows 11 machine cures nothing.
-  Unattributed: the emulated leg fails at an earlier stage, from start on. The record states
-      windows-2025's failure at S with both logs, and the fork goes to the owner without an
-      attribution.
-  An emulated leg whose last stage is runtime, build or launch is (i) for that leg: run again.
-The arm64 leg's role is unchanged: it settles the arm64 keyboard line.
+self-contained, so the legs differ only in architecture and OS. The last stage a leg's log
+reached says whose failure it is:
+  runtime, build or launch: the probe's own machinery failed. Fix it and run again before
+      reading anything else into the leg.
+  start or later: the program's or the OS's outcome at that stage, whether the window's
+      process is still running or has exited; an exited window's code is printed.
+  keys, with a 'focus before keys:' line naming a process other than S12WinUI (the
+      first-sign-in privacy window's WWAHost on windows-11-arm): the runner
+      image's state, a foreign window holds the foreground. It says nothing of the program or
+      the architecture, so the leg is run again once the foreground is the program's. Native
+      arm64 and emulated x64 fail alike when the image is the cause.
+When the same stage fails on windows-2025 and on the emulated leg, the program is the likelier
+cause; when only windows-2025 fails it, the OS is.
 
 .PARAMETER Application
 The built S12WinUI.exe.
@@ -145,6 +143,20 @@ function Wait-Focus {
   throw "focus not on the '$ButtonName' button of process $ProcessId within $Seconds s: $(Get-Holder -Element $Automation.FocusedElement())"
 }
 
+function Get-TopWindow {
+  [CmdletBinding()]
+  [OutputType([FlaUI.Core.AutomationElements.AutomationElement])]
+  param(
+    [Parameter(Mandatory)][FlaUI.UIA3.UIA3Automation]$Automation,
+    [Parameter(Mandatory)][FlaUI.Core.AutomationElements.AutomationElement]$Element
+  )
+  $desktop = $Automation.GetDesktop()
+  $walker = $Automation.TreeWalkerFactory.GetControlViewWalker()
+  $top = $Element
+  for ($parent = $walker.GetParent($top); $null -ne $parent -and -not $parent.Equals($desktop); $parent = $walker.GetParent($top)) { $top = $parent }
+  $top
+}
+
 function Get-Holder {
   [CmdletBinding()]
   [OutputType([string])]
@@ -154,6 +166,65 @@ function Get-Holder {
   "$($Element.ControlType) name '$($Element.Name)' process $holder ($name)"
 }
 
+function Clear-ForeignForeground {
+  [CmdletBinding()]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory)][FlaUI.UIA3.UIA3Automation]$Automation,
+    [Parameter(Mandatory)][FlaUI.Core.AutomationElements.AutomationElement]$Form,
+    [Parameter(Mandatory)][FlaUI.Core.AutomationElements.AutomationElement]$Edit,
+    [Parameter(Mandatory)][int]$ProcessId
+  )
+  $buttons = $Automation.ConditionFactory.ByControlType([FlaUI.Core.Definitions.ControlType]::Button)
+  $deadline = (Get-Date).AddSeconds(60)
+  $last = ''
+  while ((Get-Date) -lt $deadline) {
+    $Form.SetForeground()
+    $Edit.Focus()
+    $focused = $Automation.FocusedElement()
+    if ($focused.Properties.ProcessId.Value -eq $ProcessId) { return }
+    try {
+      $top = Get-TopWindow -Automation $Automation -Element $focused
+      $foreign = "window '$($top.Name)' of $(Get-Holder -Element $top)"
+      $candidates = @($top.FindAllDescendants($buttons))
+      $button = $candidates | Where-Object -FilterScript { $_.Name -eq 'Accept' } | Select-Object -First 1
+      if ($null -eq $button) { $button = $candidates | Where-Object -FilterScript { $_.Name -like 'Next*' } | Select-Object -First 1 }
+      if ($null -eq $button) {
+        $seen = "$foreign offers no button named Accept or Next (buttons: $(($candidates | ForEach-Object -Process { "'$($_.Name)'" }) -join ', '))"
+        if ($seen -ne $last) { $seen }
+        $last = $seen
+      }
+      elseif (-not $button.Patterns.Invoke.IsSupported) {
+        "button '$($button.Name)' of $foreign offers no Invoke pattern"
+      }
+      else {
+        "pressing button '$($button.Name)' of $foreign through the Invoke pattern"
+        $button.Patterns.Invoke.Pattern.Invoke()
+      }
+    }
+    catch [System.Runtime.InteropServices.COMException] {
+      # The privacy window replaces its page between reads; the next pass reads the new one.
+      "foreign window changed while read: $($_.Exception.Message)"
+    }
+    Start-Sleep -Milliseconds 1000
+  }
+}
+
+function Set-PrivacyPolicy {
+  [CmdletBinding(SupportsShouldProcess)]
+  [OutputType([string])]
+  param()
+  $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE'
+  if ($PSCmdlet.ShouldProcess($key, 'set DisablePrivacyExperience to 1')) {
+    if (-not (Test-Path -Path $key)) { $null = New-Item -Path $key }
+    $null = New-ItemProperty -Path $key -Name 'DisablePrivacyExperience' -Value 1 -PropertyType DWord -Force
+    $value = (Get-ItemProperty -Path $key -Name 'DisablePrivacyExperience').DisablePrivacyExperience
+    "policy: $key DisablePrivacyExperience = $value (DWORD)"
+    if ($value -ne 1) { throw "$key DisablePrivacyExperience reads back as $value, expected 1" }
+  }
+}
+
+Set-PrivacyPolicy
 $log = Join-Path -Path $work -ChildPath 'window.log'
 'stage: start'
 $app = Start-Process -FilePath $Application -ArgumentList @("`"$log`"") -PassThru
@@ -194,22 +265,29 @@ try {
   $focused = $automation.FocusedElement()
   "focus before keys: $(Get-Holder -Element $focused)"
   if ($focused.Properties.ProcessId.Value -ne $app.Id) {
-    $walker = $automation.TreeWalkerFactory.GetControlViewWalker()
-    $top = $focused
-    for ($parent = $walker.GetParent($top); $null -ne $parent -and -not $parent.Equals($desktop); $parent = $walker.GetParent($top)) { $top = $parent }
+    $top = Get-TopWindow -Automation $automation -Element $focused
     $foreign = "window '$($top.Name)' of $(Get-Holder -Element $top)"
-    if (-not $top.Patterns.Window.IsSupported) { throw "foreground held by $foreign, which offers no Window pattern" }
-    "closing $foreign through the Window pattern"
-    $top.Patterns.Window.Pattern.Close()
-    $deadline = (Get-Date).AddSeconds(30)
-    do {
-      Start-Sleep -Milliseconds 200
-      $form.SetForeground()
-      $edit.Focus()
+    if ($top.Patterns.Window.IsSupported) {
+      "closing $foreign through the Window pattern"
+      $top.Patterns.Window.Pattern.Close()
+      $deadline = (Get-Date).AddSeconds(30)
+      do {
+        Start-Sleep -Milliseconds 200
+        $form.SetForeground()
+        $edit.Focus()
+        $focused = $automation.FocusedElement()
+      } while ($focused.Properties.ProcessId.Value -ne $app.Id -and (Get-Date) -lt $deadline)
+      "focus after closing: $(Get-Holder -Element $focused)"
+    }
+    else {
+      "$foreign offers no Window pattern"
+    }
+    if ($focused.Properties.ProcessId.Value -ne $app.Id) {
+      Clear-ForeignForeground -Automation $automation -Form $form -Edit $edit -ProcessId $app.Id
       $focused = $automation.FocusedElement()
-    } while ($focused.Properties.ProcessId.Value -ne $app.Id -and (Get-Date) -lt $deadline)
-    "focus after closing: $(Get-Holder -Element $focused)"
-    if ($focused.Properties.ProcessId.Value -ne $app.Id) { throw "foreground still not the application's within 30 s of closing $foreign" }
+      "focus after the buttons: $(Get-Holder -Element $focused)"
+      if ($focused.Properties.ProcessId.Value -ne $app.Id) { throw "foreground held by $(Get-Holder -Element $focused), released by neither the Window pattern nor an Accept or Next button within 60 s (first seen: $foreign)" }
+    }
   }
   [FlaUI.Core.Input.Keyboard]::Type('keys')
   [FlaUI.Core.Input.Keyboard]::Type([FlaUI.Core.WindowsAPI.VirtualKeyShort[]]@([FlaUI.Core.WindowsAPI.VirtualKeyShort]::ENTER))

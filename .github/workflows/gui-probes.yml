@@ -1,6 +1,7 @@
-# Settles, on GitHub's standard hosted runners, what S12's design cannot run
-# without them. Dispatched by hand in a throwaway public repository; nothing
-# here holds or reads a credential.
+# Settles, on GitHub's standard hosted runners, whether GUI test jobs run on them:
+# a WinUI 3 window driven through UI Automation on Windows, an accelerated Android
+# emulator, and a JavaFX window on macOS. Dispatched by hand; nothing here holds
+# or reads a credential.
 name: gui-probes
 
 on:
@@ -61,7 +62,8 @@ jobs:
           'stage: build'
           dotnet build probes/winui/S12WinUI.csproj --configuration Release --runtime win-${{ matrix.runtime }} --self-contained true --output build/winui
       # Inner bounds: 3 package downloads x 120 s + the window 60 s + 6 waits x 30 s + the closing loop 30 s
-      # = 630 s. 15 minutes exceed them, so the driver reports a failure before GitHub cancels the step.
+      # + the privacy window's buttons 60 s = 690 s. 15 minutes exceed them, so the driver reports a failure
+      # before GitHub cancels the step.
       - name: A WinUI 3 window on the job's desktop takes UI Automation and keys
         shell: powershell
         timeout-minutes: 15
