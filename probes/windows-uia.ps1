@@ -14,14 +14,14 @@ and the label shows the activation.
 
 Synthesised keys reach only the foreground window. Before the window starts, the policy
 HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE DisablePrivacyExperience is set to 1 (DWORD),
-logged and read back: the hosted windows-11-arm image shows its first-sign-in privacy window
-(WWAHost) on the desktop, and the policy is the first means against it. Before typing, the
-focused element is read; when another process holds it, that element's top-level window is
-closed through UI Automation's Window pattern first. If a foreign window still holds the
-foreground, its button named Accept, or else the one named Next..., is pressed through the
-Invoke pattern, repeatedly, for at most 60 s; each window and button pressed is logged. Focus
-is then asserted to be the application's, or the probe fails naming the holding process and
-window.
+logged and read back. It does not dismiss a first-sign-in privacy window already shown, and
+the hosted windows-11-arm image has that window (WWAHost) on the desktop when the job starts.
+Before typing, the focused element is read; when another process holds it, that element's
+top-level window is closed through UI Automation's Window pattern first. If a foreign window
+still holds the foreground, its button whose name begins Accept, or else the one beginning
+Next, is pressed through the Invoke pattern, repeatedly, for at most 60 s; each window and
+button pressed is logged. Focus is then asserted to be the application's, or the probe fails
+naming the holding process and window.
 
 Windows PowerShell 5.1, because FlaUI's net48 assemblies load into it on every image. FlaUI
 5.0.0 and its interop come from nuget.org, each checked against the SHA-256 of the package
@@ -187,10 +187,14 @@ function Clear-ForeignForeground {
       $top = Get-TopWindow -Automation $Automation -Element $focused
       $foreign = "window '$($top.Name)' of $(Get-Holder -Element $top)"
       $candidates = @($top.FindAllDescendants($buttons))
-      $button = $candidates | Where-Object -FilterScript { $_.Name -eq 'Accept' } | Select-Object -First 1
+      # The privacy window names its buttons in full: 'Next, tab through all privacy settings to
+      # continue' on its first page; on its last, 'Accept these privacy settings' among four
+      # setting toggles named by their descriptions, 'Learn more' and 'Accessibility'. Each
+      # prefix admits one button of the page it is read on.
+      $button = $candidates | Where-Object -FilterScript { $_.Name -like 'Accept*' } | Select-Object -First 1
       if ($null -eq $button) { $button = $candidates | Where-Object -FilterScript { $_.Name -like 'Next*' } | Select-Object -First 1 }
       if ($null -eq $button) {
-        $seen = "$foreign offers no button named Accept or Next (buttons: $(($candidates | ForEach-Object -Process { "'$($_.Name)'" }) -join ', '))"
+        $seen = "$foreign offers no button beginning Accept or Next (buttons: $(($candidates | ForEach-Object -Process { "'$($_.Name)'" }) -join ', '))"
         if ($seen -ne $last) { $seen }
         $last = $seen
       }
